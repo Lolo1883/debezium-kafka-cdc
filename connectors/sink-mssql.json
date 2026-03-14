@@ -1,0 +1,36 @@
+{
+  "name": "kep-mssql-sink",
+  "config": {
+    "connector.class": "io.confluent.connect.jdbc.JdbcSinkConnector",
+    "tasks.max": "1",
+
+    "connection.url":      "jdbc:sqlserver://mssql:1433;databaseName=kep_target;encrypt=false;trustServerCertificate=true",
+    "connection.user":     "sa",
+    "connection.password": "KEP_Strong!Pass123",
+
+    "topics": "kep.public.devices,kep.public.energy_readings",
+
+    "auto.create": "true",
+    "auto.evolve": "true",
+
+    "insert.mode": "upsert",
+    "pk.mode":     "record_key",
+    "batch.size":  "100",
+
+    "transforms": "unwrap,route",
+
+    "transforms.unwrap.type":                     "io.debezium.transforms.ExtractNewRecordState",
+    "transforms.unwrap.drop.tombstones":          "false",
+    "transforms.unwrap.delete.handling.mode":     "rewrite",
+    "transforms.unwrap.add.fields":               "op,ts_ms",
+
+    "transforms.route.type":        "org.apache.kafka.connect.transforms.RegexRouter",
+    "transforms.route.regex":       "kep\\.public\\.(.*)",
+    "transforms.route.replacement": "$1",
+
+    "key.converter":                  "org.apache.kafka.connect.json.JsonConverter",
+    "key.converter.schemas.enable":   "true",
+    "value.converter":                "org.apache.kafka.connect.json.JsonConverter",
+    "value.converter.schemas.enable": "true"
+  }
+}

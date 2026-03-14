@@ -1,0 +1,184 @@
+version: '3.8'
+
+# KEP CDC Pipeline POC
+# Simulates: KEP (Scaleway/PostgreSQL) -> Kafka + Debezium -> MSSQL (Hetzner)
+# +-----------+     +------------------+     +-----------+
+# | PostgreSQL| --> | Kafka + Connect  | --> |   MSSQL   |
+# | (KEP/SCW) |     | (Debezium CDC)   |     | (Hetzner) |
+# +-----------+     +------------------+     +-----------+
+
+services:
+
+  # ─── Kafka Infrastructure ────────────────────────────────────────────────────
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.0
+    hostname: zookeeper
+    container_name: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'echo ruok > /dev/tcp/localhost/2181' 2>/dev/null"]
+      interval: 10s
+      timeout: 10s
+      retries: 15
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    hostname: kafka
+    container_name: kafka
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "29092:29092"   # external access from host machine
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_LOG_RETENTION_HOURS: 24
+    healthcheck:
+      test: ["CMD", "kafka-topics", "--bootstrap-server", "localhost:9092", "--list"]
+      interval: 10s
+      timeout: 10s
+      retries: 15
+
+  # ─── Source: PostgreSQL (KEP on Scaleway) ────────────────────────────────────
+
+  postgres:
+    image: postgres:15
+    hostname: postgres
+    container_name: kep-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: kep_db
+      POSTGRES_USER: kep_user
+      POSTGRES_PASSWORD: kep_password
+    # logical replication required for Debezium CDC
+    command: >
+      postgres
+        -c wal_level=logical
+        -c max_replication_slots=5
+        -c max_wal_senders=5
+        -c wal_keep_size=512
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kep_user -d kep_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # ─── Sink: MSSQL (Hetzner target) ────────────────────────────────────────────
+
+  mssql:
+    image: mcr.microsoft.com/azure-sql-edge:latest   # ARM64-native, works on Apple Silicon
+    hostname: mssql
+    container_name: kep-mssql
+    ports:
+      - "1433:1433"
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: "KEP_Strong!Pass123"
+      MSSQL_PID: Developer
+      MSSQL_MEMORY_LIMIT_MB: 1500
+    volumes:
+      - mssql_data:/var/opt/mssql
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/localhost/1433' 2>/dev/null"]
+      interval: 10s
+      timeout: 10s
+      retries: 15
+      start_period: 30s
+
+  # ─── MSSQL init (creates kep_target DB once MSSQL is healthy) ───────────────
+  # Azure SQL Edge doesn't include sqlcmd, so we use a Python container instead.
+
+  mssql-init:
+    build:
+      context: ./mssql
+      dockerfile: Dockerfile
+    image: kep-pymssql          # tag the built image so verify.sh can reuse it
+    container_name: mssql-init
+    depends_on:
+      mssql:
+        condition: service_healthy
+    volumes:
+      - ./mssql:/init
+    command: python /init/init-db.py
+    restart: "no"
+
+  # ─── Kafka Connect (Debezium source + JDBC sink) ─────────────────────────────
+
+  kafka-connect:
+    build:
+      context: ./connect
+      dockerfile: Dockerfile
+    hostname: kafka-connect
+    container_name: kafka-connect
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      mssql:
+        condition: service_healthy
+    ports:
+      - "8083:8083"
+    environment:
+      CONNECT_BOOTSTRAP_SERVERS: kafka:9092
+      CONNECT_REST_ADVERTISED_HOST_NAME: kafka-connect
+      CONNECT_REST_PORT: 8083
+      CONNECT_GROUP_ID: kep-connect-group
+
+      # Internal Kafka topics for Connect state
+      CONNECT_CONFIG_STORAGE_TOPIC: _kep-connect-configs
+      CONNECT_OFFSET_STORAGE_TOPIC: _kep-connect-offsets
+      CONNECT_STATUS_STORAGE_TOPIC: _kep-connect-status
+      CONNECT_CONFIG_STORAGE_REPLICATION_FACTOR: 1
+      CONNECT_OFFSET_STORAGE_REPLICATION_FACTOR: 1
+      CONNECT_STATUS_STORAGE_REPLICATION_FACTOR: 1
+
+      # Use JSON (no Schema Registry needed for this POC)
+      CONNECT_KEY_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      CONNECT_VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      CONNECT_KEY_CONVERTER_SCHEMAS_ENABLE: "true"
+      CONNECT_VALUE_CONVERTER_SCHEMAS_ENABLE: "true"
+
+      CONNECT_PLUGIN_PATH: /usr/share/java,/usr/share/confluent-hub-components
+
+      # Reduce noisy logging
+      CONNECT_LOG4J_LOGGERS: "org.apache.zookeeper=WARN,org.I0Itec.zkclient=WARN,org.reflections=ERROR"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8083/connectors"]
+      interval: 10s
+      timeout: 10s
+      retries: 20
+      start_period: 90s
+
+  # ─── Kafka UI (observability) ─────────────────────────────────────────────────
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: kafka-ui
+    depends_on:
+      - kafka
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: kep-local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      DYNAMIC_CONFIG_ENABLED: "true"
+
+volumes:
+  postgres_data:
+  mssql_data:

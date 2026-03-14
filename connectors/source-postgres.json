@@ -1,0 +1,32 @@
+{
+  "name": "kep-postgres-source",
+  "config": {
+    "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+    "tasks.max": "1",
+
+    "database.hostname": "postgres",
+    "database.port":     "5432",
+    "database.user":     "kep_user",
+    "database.password": "kep_password",
+    "database.dbname":   "kep_db",
+
+    "topic.prefix":       "kep",
+    "table.include.list": "public.devices,public.energy_readings",
+
+    "plugin.name":                 "pgoutput",
+    "publication.name":            "kep_publication",
+    "publication.autocreate.mode": "disabled",
+    "slot.name":                   "kep_debezium_slot",
+
+    "snapshot.mode":     "initial",
+    "heartbeat.interval.ms": "10000",
+
+    "key.converter":                 "org.apache.kafka.connect.json.JsonConverter",
+    "key.converter.schemas.enable":  "true",
+    "value.converter":               "org.apache.kafka.connect.json.JsonConverter",
+    "value.converter.schemas.enable":"true",
+
+    "decimal.handling.mode": "double",
+    "time.precision.mode":   "connect"
+  }
+}

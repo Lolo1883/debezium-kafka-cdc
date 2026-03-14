@@ -1,0 +1,8 @@
+# Environment / secrets
+blueprint/.env
+
+# macOS
+.DS_Store
+
+# Docker volumes (local data, not code)
+**/data/

@@ -1,0 +1,137 @@
+version: '3.8'
+
+# =============================================================================
+# KEP CDC Stack — Production VM
+# Deploy this on a VM that has network access to:
+#   - Scaleway managed PostgreSQL  (port 5432)
+#   - Hetzner MSSQL Windows Server (port 1433)
+#
+# Databases are NOT in this compose — they are external.
+# Fill in .env (copy from .env.example) before running.
+#
+# Usage:
+#   cp .env.example .env && vi .env
+#   docker compose up -d --build
+#   ./register-connectors.sh
+# =============================================================================
+
+services:
+
+  # ─── Kafka Infrastructure ──────────────────────────────────────────────────
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.0
+    hostname: zookeeper
+    container_name: zookeeper
+    restart: unless-stopped
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    volumes:
+      - zookeeper_data:/var/lib/zookeeper/data
+      - zookeeper_log:/var/lib/zookeeper/log
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'echo ruok > /dev/tcp/localhost/2181' 2>/dev/null"]
+      interval: 10s
+      timeout: 10s
+      retries: 15
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    hostname: kafka
+    container_name: kafka
+    restart: unless-stopped
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "9092:9092"     # internal (within Docker network)
+      - "29092:29092"   # external (from outside the VM, e.g. for monitoring tools)
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+
+      # PLAINTEXT  = internal Docker network (Connect → Kafka)
+      # EXTERNAL   = from outside the VM (optional, for tooling/monitoring)
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://${KAFKA_HOST}:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+
+      # Keep CDC events for 7 days (gives time to recover if sink is down)
+      KAFKA_LOG_RETENTION_HOURS: 168
+      KAFKA_LOG_RETENTION_BYTES: 10737418240  # 10 GB per topic partition cap
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD", "kafka-topics", "--bootstrap-server", "localhost:9092", "--list"]
+      interval: 10s
+      timeout: 10s
+      retries: 15
+
+  # ─── Kafka Connect (Debezium source + JDBC sink) ───────────────────────────
+
+  kafka-connect:
+    build:
+      context: ../connect        # reuses the same Dockerfile from the POC
+      dockerfile: Dockerfile
+    hostname: kafka-connect
+    container_name: kafka-connect
+    restart: unless-stopped
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8083:8083"
+    environment:
+      CONNECT_BOOTSTRAP_SERVERS: kafka:9092
+      CONNECT_REST_ADVERTISED_HOST_NAME: kafka-connect
+      CONNECT_REST_PORT: 8083
+      CONNECT_GROUP_ID: kep-connect-group
+
+      CONNECT_CONFIG_STORAGE_TOPIC: _kep-connect-configs
+      CONNECT_OFFSET_STORAGE_TOPIC: _kep-connect-offsets
+      CONNECT_STATUS_STORAGE_TOPIC: _kep-connect-status
+      CONNECT_CONFIG_STORAGE_REPLICATION_FACTOR: 1
+      CONNECT_OFFSET_STORAGE_REPLICATION_FACTOR: 1
+      CONNECT_STATUS_STORAGE_REPLICATION_FACTOR: 1
+
+      CONNECT_KEY_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      CONNECT_VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      CONNECT_KEY_CONVERTER_SCHEMAS_ENABLE: "true"
+      CONNECT_VALUE_CONVERTER_SCHEMAS_ENABLE: "true"
+
+      CONNECT_PLUGIN_PATH: /usr/share/java,/usr/share/confluent-hub-components
+      CONNECT_LOG4J_LOGGERS: "org.apache.zookeeper=WARN,org.I0Itec.zkclient=WARN,org.reflections=ERROR"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8083/connectors"]
+      interval: 10s
+      timeout: 10s
+      retries: 20
+      start_period: 90s
+
+  # ─── Kafka UI ──────────────────────────────────────────────────────────────
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: kafka-ui
+    restart: unless-stopped
+    depends_on:
+      - kafka
+    ports:
+      - "8080:8080"      # access via http://<VM_IP>:8080 — firewall this in production
+    environment:
+      KAFKA_CLUSTERS_0_NAME: kep-production
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      KAFKA_CLUSTERS_0_KAFKACONNECT_0_NAME: kep-connect
+      KAFKA_CLUSTERS_0_KAFKACONNECT_0_ADDRESS: http://kafka-connect:8083
+      DYNAMIC_CONFIG_ENABLED: "true"
+
+volumes:
+  zookeeper_data:
+  zookeeper_log:
+  kafka_data:

@@ -1,0 +1,34 @@
+{
+  "name": "kep-postgres-source",
+  "config": {
+    "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+    "tasks.max": "1",
+
+    "database.hostname": "${PG_HOST}",
+    "database.port":     "${PG_PORT}",
+    "database.user":     "${PG_USER}",
+    "database.password": "${PG_PASSWORD}",
+    "database.dbname":   "${PG_DATABASE}",
+
+    "topic.prefix":       "${TOPIC_PREFIX}",
+    "table.include.list": "${TABLES}",
+
+    "plugin.name":                 "pgoutput",
+    "publication.name":            "kep_cdc_publication",
+    "publication.autocreate.mode": "disabled",
+    "slot.name":                   "kep_debezium_slot",
+
+    "snapshot.mode":         "initial",
+    "heartbeat.interval.ms": "30000",
+
+    "key.converter":                  "org.apache.kafka.connect.json.JsonConverter",
+    "key.converter.schemas.enable":   "true",
+    "value.converter":                "org.apache.kafka.connect.json.JsonConverter",
+    "value.converter.schemas.enable": "true",
+
+    "decimal.handling.mode": "double",
+    "time.precision.mode":   "connect",
+
+    "database.sslmode": "require"
+  }
+}
